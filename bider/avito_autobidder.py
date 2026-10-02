@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Автобидер Авито (CPA-клики, actionTypeID=5) — кабинет «Фабрика Мебели».
+Автобидер Авито. Цифры кабинета не зашиты: цель лида, потолки и тип оплаты
+приходят из --cabinet или флагов. Логика одна для всех ниш.
 
-1) Чаты 60д → плавный множитель часа + день недели (МСК).
-2) Только живые объявления (views≥5 / контакты / уже есть ставка), фокус топ-N.
-3) Prior CR кабинета: contacts/(spend/avg_bid) если возможно, иначе contacts/views.
-4) Ставка ≈ 1000 × CR × hour × dow × cpl_brake. Цель 1000, soft 1200, hard 1500.
-5) CPL-стоп: >1200 → ×0.9, >1300 → ×0.75, >1500 → ×0.6.
-6) Dry-run по умолчанию. --apply пишет только --apply-top лучших.
-7) Ключи: AVITO_CLIENT_ID / AVITO_CLIENT_SECRET. Секреты не печатать.
+Ключи: AVITO_CLIENT_ID / AVITO_CLIENT_SECRET. Секреты не печатать.
 """
 
 from __future__ import annotations
@@ -60,6 +55,65 @@ HOUR_MULT_MAX = 1.20
 DOW_MULT_MIN = 0.70
 DOW_MULT_MAX = 1.10
 MAX_STEP_RATIO = 0.30  # не менять текущую ставку больше чем на 30% за проход
+
+
+def load_cabinet(name: str) -> dict:
+    if not name:
+        return {}
+    path = Path(__file__).resolve().parent / "cabinets" / f"{name}.json"
+    if not path.exists():
+        raise SystemExit(f"Нет файла кабинета: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit(f"Кабинет {name} должен быть JSON-объектом")
+    return data
+
+
+def bind_cabinet(args: argparse.Namespace) -> dict:
+    """Подставляет цену лида и лимиты кабинета. Флаги командной строки важнее файла."""
+    global TARGET_CPL, SOFT_CPL, HARD_CPL, CPL_BRAKE_SOFT, ACTION_CLICK
+    cfg = load_cabinet(getattr(args, "cabinet", "") or "")
+    if args.target_cpl is None:
+        args.target_cpl = float(cfg.get("target_cpl", TARGET_CPL))
+    if args.soft_cpl is None:
+        args.soft_cpl = float(cfg.get("soft_cpl", SOFT_CPL))
+    if args.hard_cpl is None:
+        args.hard_cpl = float(cfg.get("hard_cpl", HARD_CPL))
+    if args.brake_cpl is None:
+        args.brake_cpl = float(cfg.get("brake_cpl", CPL_BRAKE_SOFT))
+    if args.action_type is None:
+        args.action_type = int(cfg.get("action_type", ACTION_CLICK))
+    if args.days is None:
+        args.days = int(cfg.get("days", 60))
+    if args.top_n is None:
+        args.top_n = int(cfg.get("top_n", DEFAULT_TOP_N))
+    if args.apply_top is None:
+        args.apply_top = int(cfg.get("apply_top", DEFAULT_APPLY_TOP))
+    if args.vas_max is None:
+        args.vas_max = int(cfg.get("vas_max", VAS_MAX_PER_DAY))
+    if not args.apply and cfg.get("write_bids"):
+        args.apply = True
+    if not args.apply_vas and cfg.get("buy_vas"):
+        args.apply_vas = True
+    TARGET_CPL = float(args.target_cpl)
+    SOFT_CPL = float(args.soft_cpl)
+    HARD_CPL = float(args.hard_cpl)
+    CPL_BRAKE_SOFT = float(args.brake_cpl)
+    ACTION_CLICK = int(args.action_type)
+    cfg["target_cpl"] = TARGET_CPL
+    cfg["soft_cpl"] = SOFT_CPL
+    cfg["hard_cpl"] = HARD_CPL
+    cfg["brake_cpl"] = CPL_BRAKE_SOFT
+    cfg["action_type"] = ACTION_CLICK
+    args.cabinet_label = str(cfg.get("name") or args.cabinet or "")
+    args.niche = str(cfg.get("niche") or "")
+    print(
+        f"кабинет {cfg.get('name') or args.cabinet or 'по флагам'} "
+        f"лид {TARGET_CPL:.0f}/{SOFT_CPL:.0f}/{HARD_CPL:.0f} "
+        f"тормоз {CPL_BRAKE_SOFT:.0f} actionType={ACTION_CLICK}",
+        flush=True,
+    )
+    return cfg
 
 
 def load_env_file(path: Path) -> None:
@@ -945,6 +999,9 @@ def run_once(args: argparse.Namespace) -> int:
         "ran_at_msk": now.isoformat(timespec="minutes"),
         "account_id": user_id,
         "account_name": safe.get("name"),
+        "cabinet_label": getattr(args, "cabinet_label", "") or args.cabinet,
+        "niche": getattr(args, "niche", ""),
+        "action_type": ACTION_CLICK,
         "days": args.days,
         "chats": analysis["total_chats"],
         "peak_hours": analysis["peak_hours"],
@@ -1008,31 +1065,24 @@ def run_once(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Avito CPA click autobidder")
-    p.add_argument("--days", type=int, default=60, help="окно сообщений и статистики")
+    p = argparse.ArgumentParser(description="Универсальный автобидер Авито")
+    p.add_argument("--cabinet", default="", help="имя файла в bider/cabinets без .json")
+    p.add_argument("--days", type=int, default=None, help="окно сообщений и статистики")
     p.add_argument("--out", default="", help="папка результата")
     p.add_argument("--apply", action="store_true", help="записать ставки (иначе dry-run)")
-    p.add_argument("--top-n", type=int, default=DEFAULT_TOP_N, help="сколько живых объявлений считать")
-    p.add_argument(
-        "--apply-top",
-        type=int,
-        default=DEFAULT_APPLY_TOP,
-        help="при --apply писать ставки только топ-N по контактам",
-    )
+    p.add_argument("--top-n", type=int, default=None, help="сколько живых объявлений считать")
+    p.add_argument("--apply-top", type=int, default=None, help="при --apply писать ставки только топ-N")
+    p.add_argument("--target-cpl", type=float, default=None, help="адекватная цена лида, ₽")
+    p.add_argument("--soft-cpl", type=float, default=None, help="мягкий верх цены лида, ₽")
+    p.add_argument("--brake-cpl", type=float, default=None, help="с этой цены лида начинать сильнее резать ставки")
+    p.add_argument("--hard-cpl", type=float, default=None, help="жёсткий край цены лида, ₽")
+    p.add_argument("--action-type", type=int, default=None, help="5 клики, 1 звонок, 7 мессенджер")
     p.add_argument("--loop", action="store_true", help="крутить непрерывно")
     p.add_argument("--interval-min", type=int, default=60, help="пауза между проходами в --loop")
-    p.add_argument(
-        "--vas-max",
-        type=int,
-        default=VAS_MAX_PER_DAY,
-        help="сколько новых XL/цвета/плашек в сутки, не больше 2; 0 = не подключать",
-    )
-    p.add_argument(
-        "--apply-vas",
-        action="store_true",
-        help="купить VAS (иначе только план). Уже висящие 7 дней пропускаются",
-    )
+    p.add_argument("--vas-max", type=int, default=None, help="новых XL/цвета/плашек в сутки, 0..2")
+    p.add_argument("--apply-vas", action="store_true", help="купить VAS (иначе только план)")
     args = p.parse_args()
+    bind_cabinet(args)
     if not args.out:
         args.out = str(Path(__file__).resolve().parent / "out")
     if not args.loop:
