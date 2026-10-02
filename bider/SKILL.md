@@ -95,6 +95,7 @@ Baseline с первого прогона (пересчитывать кажды
 8. Для объявлений с трафиком посчитать `new_bid_rub`. Чужой `actionTypeID` (не 5 и не пустой) — **не трогать**.
 9. **Dry-run по умолчанию:** не вызывать `POST /cpxpromo/1/setManual`.
 10. Отчёт (коротко): час МСК, зона, chats, CR, CPL, spend, сколько объявлений scored / would-change, 5–10 примеров `item_id current→new`. Без секретов.
+11. Залогировать прогон в git по разделу «Лог на GitHub» и запушить в `xz`. Без этого запуск не завершён.
 
 ### Запись ставок (только если явно разрешено)
 
@@ -127,6 +128,56 @@ python3 avito_autobidder.py --loop --interval-min 60   # непрерывный 
 - `message_heatmap.html`, `message_hours.csv`, `message_hours.json`
 - `bids.csv`, `summary.json`, `runs.jsonl`
 
+## Лог на GitHub
+
+После каждого прогона (и после падения) закоммить один файл и запушить в ветку `xz`:
+
+`bider/logs/YYYY-MM-DD-HH.md` — час по Москве, например `bider/logs/2026-10-02-11.md`.
+
+Плюс перезаписать `bider/logs/LATEST.md` тем же текстом, чтобы последний прогон открывался без поиска.
+
+В коммит только эти логи. Не коммить `.env`, токены, `out/` целиком, сырые чаты и имена клиентов.
+
+Шаблон лога:
+
+```markdown
+# Прогон YYYY-MM-DD HH:00 МСК
+
+- Итог: ok | partial | failed
+- Режим: dry-run | apply
+- Кабинет: имя / id
+
+## Шаги
+
+| Шаг | Статус | Деталь |
+|-----|--------|--------|
+| auth | ok/fail | HTTP-код, без токена |
+| chats | ok/fail | сколько чатов, пик/тишина |
+| account stats | ok/fail | views, contacts, CR |
+| spendings | ok/fail | spend ₽, CPL |
+| items + bids | ok/fail | сколько объявлений, сколько would-change |
+| setManual | skipped/ok/fail | только если apply |
+
+## Ошибки
+
+Для каждой: шаг, HTTP или исключение, причина своими словами, что повторить в следующий раз.
+Если ошибок нет — строка «нет».
+
+## Цифры
+
+Час, зона, mult, chats, CR, CPL, target 1000 / soft 1200 / hard 1500.
+5–10 примеров item_id: current → new, reason.
+
+## Что мешает бидеру
+
+1–3 конкретных узких места этого прогона (429, пустая статистика, нет секрета, чужой actionType).
+Это список, по которому упрощаем бидер. Не общие советы.
+```
+
+Коммит: `bider log YYYY-MM-DD HH MSK`. Пуш в `origin xz`. Если пуш не прошёл — напиши это в ответе автоматизации, лог всё равно оставь в рабочей копии.
+
+Смотреть историю: папка `bider/logs/` на https://github.com/abramovmarketing88-byte/Avito/tree/xz/bider/logs
+
 ## Лимиты и ошибки API
 
 | Ситуация | Действие |
@@ -152,7 +203,7 @@ Messenger: `/messenger/v2/.../chats`
 | Default | dry-run |
 | Inactive → Active | после проверки Test |
 
-Инструкция автоматизации может быть короткой: «Следуй `bider/SKILL.md`; запусти `python3 bider/avito_autobidder.py --days 60`; отчёт из summary».
+Инструкция автоматизации: текст из `bider/AGENT_INSTRUCTIONS.md` (запуск скрипта + обязательный лог в `bider/logs/` и пуш в `xz`).
 
 Локальный cron на ПК **не заменяет** облако: если компьютер выключен, локальный прогон не случится. Облачная автоматизация работает без ПК.
 
