@@ -285,7 +285,11 @@ def time_multipliers(now: datetime, analysis: dict) -> dict:
     max_r = max(ratios.values()) if ratios else 1.0
     max_r = max_r or 1.0
     r = ratios.get(now.hour, 0.0)
-    hour_mult = clamp(HOUR_MULT_MIN, HOUR_MULT_MAX, HOUR_MULT_MIN + (HOUR_MULT_MAX - HOUR_MULT_MIN) * (r / max_r))
+    hour_mult = clamp(
+        HOUR_MULT_MIN + (HOUR_MULT_MAX - HOUR_MULT_MIN) * (r / max_r),
+        HOUR_MULT_MIN,
+        HOUR_MULT_MAX,
+    )
     band = bands.get(now.hour, "normal")
 
     dow_counts = analysis.get("by_dow_counts") or [0] * 7
@@ -293,7 +297,11 @@ def time_multipliers(now: datetime, analysis: dict) -> dict:
     today = now.weekday()
     dr = dow_counts[today] / avg_dow
     max_dr = max((c / avg_dow for c in dow_counts), default=1.0) or 1.0
-    dow_mult = clamp(DOW_MULT_MIN, DOW_MULT_MAX, DOW_MULT_MIN + (DOW_MULT_MAX - DOW_MULT_MIN) * (dr / max_dr))
+    dow_mult = clamp(
+        DOW_MULT_MIN + (DOW_MULT_MAX - DOW_MULT_MIN) * (dr / max_dr),
+        DOW_MULT_MIN,
+        DOW_MULT_MAX,
+    )
     combined = round(hour_mult * dow_mult, 3)
     return {
         "hour_mult": round(hour_mult, 3),
