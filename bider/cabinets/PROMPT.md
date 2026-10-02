@@ -45,6 +45,43 @@ cd bider && python3 avito_autobidder.py --cabinet fabrika-mebeli
 Если купил VAS — закоммить bider/state/vas_ledger.json.
 ```
 
+## Пример 2 — бухгалтерские услуги
+
+```text
+Следуй bider/SKILL.md. Секрет и токен не печатать и не коммитить.
+Ключи только из секретов этой автоматизации: AVITO_CLIENT_ID и AVITO_CLIENT_SECRET.
+
+КАБИНЕТ
+- id файла: glavnyy-buhgalter
+- Название: Главный бухгалтер
+- Ниша: бухгалтерские услуги
+- Лид: чат + телефон
+- action_type: 5
+
+ЦЕНА ЛИДА, ₽
+- target_cpl: 1000
+- soft_cpl: 1200
+- brake_cpl: 1300
+- hard_cpl: 1500
+
+ОБЪЁМ
+- days: 60
+- top_n: 50
+- apply_top: 30
+- write_bids: нет
+
+ОФОРМЛЕНИЕ
+- vas_max: 1
+- buy_vas: нет
+
+ЗАПУСК
+cd bider && python3 avito_autobidder.py --cabinet glavnyy-buhgalter
+
+После прогона залогируй в bider/logs/ и запушь ветку xz.
+```
+
+Факт по времени (МСК, 60д): пик **10–16 и 18**, тишина **0–8 и 21–23**. Рабочие дни сильнее выходных.
+
 ## Что менять от кабинета к кабинету
 
 | Поле | Зачем |
