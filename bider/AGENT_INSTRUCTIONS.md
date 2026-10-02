@@ -9,12 +9,21 @@
 cd bider && python3 avito_autobidder.py --days 60 --top-n 50
 ```
 
-По умолчанию dry-run: `setManual` не вызывать.  
-Запись только если явно сказано «включи запись» / `--apply` / `AVITO_BID_APPLY=1`, и тогда:
+По умолчанию dry-run: `setManual` не вызывать. VAS не покупать.
+
+Запись ставок только если явно сказано «включи запись» / `--apply` / `AVITO_BID_APPLY=1`:
 
 ```bash
 cd bider && python3 avito_autobidder.py --days 60 --apply --apply-top 30
 ```
+
+XL / цвет / плашка — отдельно и редко. В сутки не больше 1 (потолок 2). Если услуга уже в `bider/state/vas_ledger.json` моложе 7 дней — пропустить, можно уйти в 0 покупок. Покупка только при «включи VAS» / `--apply-vas`:
+
+```bash
+cd bider && python3 avito_autobidder.py --days 60 --apply-vas --vas-max 1
+```
+
+Приоритет: цвет, потом XL, плашка только поверх уже включённого XL. Кандидат — низкий показ→просмотр при показах ≥ 200. План писать в лог (slug, цена, CTR, купили или пропустили и почему). Если купили — закоммить `bider/state/vas_ledger.json`.
 
 Смысл v2 (не ломай):
 

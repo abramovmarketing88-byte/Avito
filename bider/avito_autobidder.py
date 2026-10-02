@@ -45,6 +45,13 @@ LIVE_MIN_VIEWS = 5  # ниже — «мёртвое» объявление, ст
 ACCOUNT_PRIOR_VIEWS = 100
 DEFAULT_TOP_N = 50  # сколько живых объявлений трогаем за проход
 DEFAULT_APPLY_TOP = 30  # при --apply пишем только топ по контактам
+# XL / цвет / плашка: неделя, не чаще 1–2 новых подключений в сутки
+VAS_WEEK_DAYS = 7
+VAS_MAX_PER_DAY = 1  # потолок задаётся --vas-max, не выше 2
+VAS_HARD_CAP = 2
+VAS_MIN_IMPRESSIONS = 200
+VAS_CTR_GAP = 0.85  # брать только если CTR объявления < 85% среднего по живым
+VAS_SLUGS = ("highlight", "xl", "stickerpack_x1")
 # зоны для отчёта (множитель часа — плавный от heatmap, не ступеньки)
 PEAK_RATIO = 1.35
 QUIET_RATIO = 0.55
@@ -331,6 +338,240 @@ def fetch_spendings_rub(token: str, user_id: int, d0: str, d1: str) -> float:
                 if (svc.get("slug") or "") in ("cpa_click_package", "presence"):
                     total += float(svc.get("value") or 0)
     return total
+
+
+def fetch_item_funnel(token: str, user_id: int, d0: str, d1: str) -> dict[int, dict]:
+    """item_id -> impressions, views, contacts. grouping=item, окно до 1000 строк."""
+    out: dict[int, dict] = {}
+    offset = 0
+    while offset <= 2000:
+        body = {
+            "dateFrom": d0,
+            "dateTo": d1,
+            "grouping": "item",
+            "metrics": ["impressions", "views", "contacts"],
+            "limit": 1000,
+            "offset": offset,
+        }
+        code, data = api(token, "POST", f"/stats/v2/accounts/{user_id}/items", body)
+        print(f"  funnel offset {offset}: HTTP {code}", flush=True)
+        if code != 200 or not isinstance(data, dict):
+            break
+        groups = (data.get("result") or {}).get("groupings") or []
+        if not groups:
+            break
+        for g in groups:
+            iid = int(g.get("id") or 0)
+            m = {x["slug"]: float(x.get("value") or 0) for x in (g.get("metrics") or [])}
+            if iid:
+                out[iid] = {
+                    "impressions": m.get("impressions", 0.0),
+                    "views": m.get("views", 0.0),
+                    "contacts": m.get("contacts", 0.0),
+                }
+        if len(groups) < 1000:
+            break
+        offset += 1000
+        time.sleep(0.3)
+    return out
+
+
+def load_vas_ledger(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return list(data.get("applies") or [])
+
+
+def save_vas_ledger(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"applies": rows[-400:]}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def vas_fresh(rows: list[dict], item_id: int, slug: str, now: datetime) -> bool:
+    for row in rows:
+        if int(row.get("item_id") or 0) != item_id or row.get("slug") != slug:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(row["applied_at"]))
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=MSK)
+        if now - ts < timedelta(days=VAS_WEEK_DAYS):
+            return True
+    return False
+
+
+def vas_today_count(rows: list[dict], now: datetime) -> int:
+    day = now.date().isoformat()
+    return sum(1 for row in rows if str(row.get("applied_at") or "").startswith(day))
+
+
+def fetch_vas_prices(token: str, user_id: int, item_ids: list[int]) -> dict[int, list[dict]]:
+    out: dict[int, list[dict]] = {}
+    for i in range(0, len(item_ids), 50):
+        batch = item_ids[i : i + 50]
+        code, data = api(
+            token,
+            "POST",
+            f"/core/v1/accounts/{user_id}/vas/prices",
+            {"itemIds": batch},
+        )
+        print(f"  vas prices {i}: HTTP {code}", flush=True)
+        rows = data if isinstance(data, list) else (data.get("result") or data.get("items") or []) if isinstance(data, dict) else []
+        for row in rows or []:
+            iid = int(row.get("itemId") or row.get("item_id") or 0)
+            if iid:
+                out[iid] = list(row.get("vas") or row.get("services") or [])
+        time.sleep(0.25)
+    return out
+
+
+def service_row(services: list[dict], slug: str) -> dict | None:
+    for s in services:
+        if (s.get("slug") or "") == slug:
+            return s
+    return None
+
+
+def service_applied(row: dict | None) -> bool:
+    if not row:
+        return False
+    return bool(row.get("isApplied") or row.get("applied") or str(row.get("status") or "") in ("active", "applied"))
+
+
+def pick_vas_slug(services: list[dict], ledger: list[dict], item_id: int, now: datetime) -> tuple[str, float] | None:
+    """Цвет, потом XL. Плашка только если XL уже на неделе. Уже висящее не покупаем."""
+    for slug in ("highlight", "xl"):
+        if vas_fresh(ledger, item_id, slug, now):
+            continue
+        row = service_row(services, slug)
+        if service_applied(row):
+            continue
+        if row and row.get("price") is not None:
+            return slug, float(row["price"])
+    xl_on = vas_fresh(ledger, item_id, "xl", now) or service_applied(service_row(services, "xl"))
+    if xl_on and not vas_fresh(ledger, item_id, "stickerpack_x1", now):
+        row = service_row(services, "stickerpack_x1")
+        if row and not service_applied(row) and row.get("price") is not None:
+            return "stickerpack_x1", float(row["price"])
+    return None
+
+
+def apply_vas(token: str, item_id: int, slug: str) -> tuple[int, object]:
+    return api(token, "PUT", f"/core/v2/items/{item_id}/vas/", {"slugs": [slug]})
+
+
+def plan_vas(
+    *,
+    token: str,
+    user_id: int,
+    now: datetime,
+    focus_ids: list[int],
+    funnel: dict[int, dict],
+    ledger_path: Path,
+    do_apply: bool,
+    vas_max: int,
+) -> tuple[list[dict], list[dict]]:
+    ledger = load_vas_ledger(ledger_path)
+    cap = max(0, min(VAS_HARD_CAP, vas_max))
+    left = max(0, cap - vas_today_count(ledger, now))
+    if left <= 0:
+        print(f"  VAS: лимит {cap}/день уже выбран, новые не считаем", flush=True)
+        return [], ledger
+    imps = []
+    views = []
+    for iid in focus_ids:
+        f = funnel.get(iid) or {}
+        imps.append(float(f.get("impressions") or 0))
+        views.append(float(f.get("views") or 0))
+    acc_ctr = (sum(views) / sum(imps)) if sum(imps) else 0.0
+    ranked = []
+    for iid in focus_ids:
+        f = funnel.get(iid) or {}
+        imp = float(f.get("impressions") or 0)
+        v = float(f.get("views") or 0)
+        if imp < VAS_MIN_IMPRESSIONS:
+            continue
+        ctr = v / imp
+        if acc_ctr and ctr >= acc_ctr * VAS_CTR_GAP:
+            continue
+        ranked.append((ctr, -imp, iid, imp, v))
+    ranked.sort()
+    shortlist = [row[2] for row in ranked[:12]]
+    prices = fetch_vas_prices(token, user_id, shortlist) if shortlist else {}
+    plan = []
+    for ctr, _neg, iid, imp, v in ranked:
+        if len([p for p in plan if p["action"] in ("dry-run", "set")]) >= left and left >= 0:
+            # всё ещё пишем skip-строки? нет, хватит отобранных слотов + причины пропуска уже покрытых
+            pass
+        chosen = pick_vas_slug(prices.get(iid) or [], ledger, iid, now)
+        if not chosen:
+            plan.append({
+                "item_id": iid,
+                "impressions": int(imp),
+                "views": int(v),
+                "ctr": round(ctr, 4),
+                "slug": "",
+                "price_rub": "",
+                "action": "skip_already_or_no_offer",
+                "status": "",
+            })
+            continue
+        slug, price = chosen
+        slots_used = sum(1 for p in plan if p["action"] in ("dry-run", "set"))
+        if slots_used >= left:
+            plan.append({
+                "item_id": iid,
+                "impressions": int(imp),
+                "views": int(v),
+                "ctr": round(ctr, 4),
+                "slug": slug,
+                "price_rub": price,
+                "action": "skip_daily_cap",
+                "status": f"cap {cap}/day",
+            })
+            continue
+        action = "set" if do_apply else "dry-run"
+        status = ""
+        if action == "set":
+            code, resp = apply_vas(token, iid, slug)
+            status = f"HTTP {code}"
+            if code == 200:
+                ledger.append({
+                    "item_id": iid,
+                    "slug": slug,
+                    "price_rub": price,
+                    "applied_at": now.isoformat(timespec="minutes"),
+                })
+            else:
+                status = f"HTTP {code} {str(resp)[:160]}"
+                action = "fail"
+            time.sleep(0.4)
+        plan.append({
+            "item_id": iid,
+            "impressions": int(imp),
+            "views": int(v),
+            "ctr": round(ctr, 4),
+            "slug": slug,
+            "price_rub": price,
+            "action": action,
+            "status": status,
+        })
+        if sum(1 for p in plan if p["action"] in ("dry-run", "set")) >= max(left, 0) and not do_apply:
+            break
+        if do_apply and sum(1 for p in plan if p["action"] == "set") >= left:
+            break
+    if do_apply:
+        save_vas_ledger(ledger_path, ledger)
+    return plan, ledger
 
 
 def get_promotions(token: str, item_ids: list[int]) -> dict[int, dict]:
@@ -675,6 +916,31 @@ def run_once(args: argparse.Namespace) -> int:
         w.writerows(decisions)
 
     would_change = sum(1 for r in decisions if r["action"] in ("dry-run", "set"))
+
+    print("воронка показ→просмотр и план VAS…", flush=True)
+    funnel = fetch_item_funnel(token, user_id, d0s, d1s)
+    ledger_path = Path(__file__).resolve().parent / "state" / "vas_ledger.json"
+    vas_max = max(0, min(VAS_HARD_CAP, int(args.vas_max)))
+    vas_plan, _ledger = plan_vas(
+        token=token,
+        user_id=user_id,
+        now=now,
+        focus_ids=focus_ids,
+        funnel=funnel,
+        ledger_path=ledger_path,
+        do_apply=bool(args.apply_vas),
+        vas_max=vas_max,
+    )
+    vas_set = [p for p in vas_plan if p["action"] in ("dry-run", "set")]
+    with (out / "vas_plan.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["item_id", "impressions", "views", "ctr", "slug", "price_rub", "action", "status"],
+        )
+        w.writeheader()
+        w.writerows(vas_plan)
+    print(f"  VAS слотов сегодня ≤{vas_max}; к подключению {len(vas_set)} (apply={bool(args.apply_vas)})", flush=True)
+
     summary = {
         "ran_at_msk": now.isoformat(timespec="minutes"),
         "account_id": user_id,
@@ -712,9 +978,13 @@ def run_once(args: argparse.Namespace) -> int:
         "apply": bool(args.apply),
         "apply_top": apply_top,
         "applied": applied,
+        "vas_max_per_day": vas_max,
+        "vas_candidates": len(vas_set),
+        "vas_applied": sum(1 for p in vas_plan if p["action"] == "set"),
         "formula": (
             "bid = clamp(1000 * CR * hour_mult * dow_mult * cpl_brake, min, max); "
-            "CR=item contacts/views or account click_est; only live top-N; ±30% step"
+            "CR=item contacts/views or account click_est; only live top-N; ±30% step; "
+            "VAS highlight/xl/sticker ≤1-2/day, skip if applied within 7 days"
         ),
     }
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -727,6 +997,7 @@ def run_once(args: argparse.Namespace) -> int:
                 for k in (
                     "chats", "dow", "band", "multiplier", "prior_cr", "prior_cr_source",
                     "account_cpl", "day_cpl", "items_live", "items_focus", "would_change", "applied",
+                    "vas_candidates", "vas_applied",
                 )
             },
             ensure_ascii=False,
@@ -750,6 +1021,17 @@ def main() -> int:
     )
     p.add_argument("--loop", action="store_true", help="крутить непрерывно")
     p.add_argument("--interval-min", type=int, default=60, help="пауза между проходами в --loop")
+    p.add_argument(
+        "--vas-max",
+        type=int,
+        default=VAS_MAX_PER_DAY,
+        help="сколько новых XL/цвета/плашек в сутки, не больше 2; 0 = не подключать",
+    )
+    p.add_argument(
+        "--apply-vas",
+        action="store_true",
+        help="купить VAS (иначе только план). Уже висящие 7 дней пропускаются",
+    )
     args = p.parse_args()
     if not args.out:
         args.out = str(Path(__file__).resolve().parent / "out")
