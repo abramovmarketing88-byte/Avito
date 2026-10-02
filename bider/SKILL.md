@@ -1,228 +1,148 @@
 ---
 name: avito-bider
 description: >-
-  Облачный автобидер Авито для кабинета «Фабрика Мебели»: анализ часов входящих
-  чатов за 60 дней, расчёт CPA-ставок клика под целевой CPL 1000/1200/1500 ₽ и
-  dry-run или запись через cpxpromo. Use when автобидер Авито, Avito bidder,
-  бидер ставок Авито, Фабрика Мебели CPA, hourly Avito bids, automation
-  abramovmarketing88-byte/Avito/xz. Not for фиды объявлений, фото, лендинги
-  или статистику без ставок.
+  Облачный автобидер Авито «Фабрика Мебели»: чаты→время спроса, ставки CPA-клика
+  только по живым объявлениям, CPL 1000/1200/1500, лог в bider/logs. Use when
+  автобидер Авито, Avito bidder, бидер ставок, Фабрика Мебели CPA,
+  abramovmarketing88-byte/Avito/xz. Not for фиды, фото, лендинги.
 ---
 
-# Автобидер Авито — «Фабрика Мебели»
+# Автобидер Авито — «Фабрика Мебели» (v2)
 
-## Контекст кабинета
+## Зачем
 
-| Параметр | Значение |
-|----------|----------|
-| Кабинет | Фабрика Мебели |
-| Account id (ориентир) | `181493224` — всегда перепроверяй через `GET /core/v1/accounts/self` |
-| Репозиторий автоматизации | `abramovmarketing88-byte/Avito`, ветка `xz` |
-| Папка в репо | `bider/` |
-| Скрипт | `bider/avito_autobidder.py` |
-| Таймзона | `Europe/Moscow` |
-| Окно данных | 60 дней |
-| Режим по умолчанию | **dry-run** (ставки в кабинет НЕ писать) |
-| Боевая запись | только при явном `--apply` или секрете/флаге `AVITO_BID_APPLY=1` |
+Ловить клиентов тогда, когда они пишут, и держать стоимость контакта около **1000 ₽** (мягкий верх 1200, край 1500). Ночью и в «пустые» часы не жечь бюджет.
 
-Ключи API только из секретов автоматизации / env:
+Факт кабинета: ~150–160 чатов / 60д, CPL ~1100–1150, **~1700 active, но живых с трафиком десятки**. Крутить все 1700 — бессмысленно.
 
-- `AVITO_CLIENT_ID`
-- `AVITO_CLIENT_SECRET`
+## Секреты
 
-**Никогда** не печатай `client_secret`, access token и содержимое `.env.local` в чат, Run History или отчёт.
+Только env / секреты автоматизации: `AVITO_CLIENT_ID`, `AVITO_CLIENT_SECRET`.  
+Не печатать и не коммитить секрет, токен, сырые чаты, имена клиентов.
 
-## Цель бизнеса
+## Правила v2 (обязательны)
 
-Держать **стоимость контакта (CPL)** около:
+### 1. Только живые объявления
 
-- адекват: **1000 ₽**
-- нормальный верх: **1200 ₽**
-- жёсткий край: **1500 ₽**
+Живое = `views ≥ 5` ИЛИ `contacts ≥ 1` ИЛИ уже стоит manual bid.  
+Остальные — **не считать и не писать ставку** (`items_dead` в summary).
 
-Контакт в метриках Авито = **чат + телефон** (поле `contacts` / `uniqContacts`), не «только звонок».
+Фокус за проход: топ **`--top-n` (50)** по contacts, затем views.  
+При записи: только топ **`--apply-top` (30)**.
 
-Оплачиваемое действие в этом кабинете — **пакет кликов** (`actionTypeID = 5`).
+### 2. Конверсия ближе к клику
 
-## Формула ставки
+Платим за клик (`actionTypeID=5`). Prior CR кабинета:
 
 ```
-CR = contacts / views   # по объявлению, если views ≥ 20; иначе CR кабинета
-bid_rub ≈ 1000 × CR × time_mult × cpl_guard
+clicks_est = spend_rub / avg_bid_rub   # avg по объявлениям с текущей ставкой
+prior_cr = contacts / clicks_est       # если clicks_est ≥ contacts
 ```
 
-Примеры (как договорились с владельцем):
+Иначе fallback: `contacts / views`.  
+По объявлению: `contacts/views` при views≥20; мало данных → prior кабинета; views≥20 и 0 контактов → prior×0.35.
 
-- CR 10% → ставка ~100 ₽ при цели 1000
-- CR 2% → ставка ~20 ₽
+### 3. Время: плавный час + день недели (МСК)
 
-Ограничения:
+Не три ступеньки. Из heatmap чатов за 60д:
 
-1. Зажать в `minBidPenny` / `maxBidPenny` из `GET /cpxpromo/1/getBids/{itemId}` (суммы в **копейках**).
-2. За один проход не менять текущую ставку больше чем на **±30%**.
-3. Если CPL кабинета > 1500 — дополнительно резать ставку (`cpl_guard < 1`).
-4. Мало статистики по объявлению → брать prior CR кабинета, не прыгать агрессивно.
-5. Views ≥ 20 и 0 контактов → prior CR × 0.35 (режем).
-
-В API **нет отдельного поля «клики»** для этой логики: для CR используем `uniqViews` / `views` как прокси трафика к контакту. Расход — из `/spendings` (`presence` / `cpa_click_package`, уже в рублях).
-
-## Множитель по времени суток (МСК)
-
-По чатам за 60 дней (`created` в `GET /messenger/v2/accounts/{user_id}/chats`):
-
-| Зона | Правило | Множитель |
-|------|---------|-----------|
-| peak | сообщений ≥ 1.35 × среднего на час и ≥ 2 | **1.15** |
-| quiet | ≤ 0.55 × среднего | **0.45** |
-| normal | всё остальное | **0.85** |
-
-Baseline с первого прогона (пересчитывать каждый час, не хардкодить навсегда):
-
-- **Пик:** 10, 11, 12, 14, 19, 22
-- **Тишина:** 1–7, 17
-
-Идея: в часы, когда люди пишут, ставки выше; ночью и в «пустые» часы — ниже, чтобы CPL не разъезжался.
-
-## Что агент делает каждый час
-
-1. Взять ключи из секретов / env. Получить token: `POST https://api.avito.ru/token` (`grant_type=client_credentials`).
-2. `GET /core/v1/accounts/self` → `user_id`, имя.
-3. Выгрузить чаты с пагинацией `limit=100`, пока `created` старше 60 дней или нет `has_more`. Построить heatmap по часу и дню недели (МСК). Определить текущий `time_mult`.
-4. Кабинет за 60 дней: `POST /stats/v2/accounts/{user_id}/items` (`views`, `contacts`, `grouping=day`) и `POST .../spendings`. Посчитать CR и CPL.
-5. Активные объявления: `GET /core/v1/items?status=active&per_page=100` (все страницы).
-6. Stats по itemIds батчами ≤200: `POST /stats/v1/accounts/{user_id}/items` (`uniqViews`, `uniqContacts`, `periodGrouping=day`).
-7. Текущие продвижения: `POST /cpxpromo/1/getPromotionsByItemIds` (`itemIDs`, ≤200).
-8. Для объявлений с трафиком посчитать `new_bid_rub`. Чужой `actionTypeID` (не 5 и не пустой) — **не трогать**.
-9. **Dry-run по умолчанию:** не вызывать `POST /cpxpromo/1/setManual`.
-10. Отчёт (коротко): час МСК, зона, chats, CR, CPL, spend, сколько объявлений scored / would-change, 5–10 примеров `item_id current→new`. Без секретов.
-11. Залогировать прогон в git по разделу «Лог на GitHub» и запушить в `xz`. Без этого запуск не завершён.
-
-### Запись ставок (только если явно разрешено)
-
-`POST /cpxpromo/1/setManual`:
-
-```json
-{
-  "itemID": 123,
-  "actionTypeID": 5,
-  "bidPenny": 1700
-}
+```
+hour_mult = clamp(0.40, 1.20, 0.40 + 0.80 * (hour_ratio / max_hour_ratio))
+dow_mult  = clamp(0.70, 1.10, 0.70 + 0.40 * (dow_ratio / max_dow_ratio))
 ```
 
-`bidPenny` в копейках. Лимит setManual ≈ 20 req/min — пауза ~3 с между записью. Перед записью уточнить min/max через `getBids`.
+Два пика (утро–день ~10–15 и вечер ~19–22) вылезают сами. Между пиками и ночью множитель ниже.
 
-## Как запускать скрипт в репо
+Baseline для sanity (пересчитывать каждый раз): пик 10–15, 19–20, 22; тишина 0–7, 17.
 
-Из корня checkout ветки `xz`:
+### 4. CPL-стоп (быстрее, чем ждать CR)
+
+Берём `day_cpl` если есть, иначе period CPL:
+
+| CPL | brake |
+|-----|-------|
+| ≤1200 | ×1.0 |
+| >1200 | ×0.90 |
+| >1300 | ×0.75 |
+| >1500 | ×0.60 |
+
+### 5. Формула ставки
+
+```
+mult = hour_mult * dow_mult * cpl_brake
+bid  = clamp(1000 × CR × mult, minBid, maxBid)
+```
+
+Шаг за проход ≤ **±30%** от текущей.  
+Чужой `actionTypeID` (1 звонок / 7 мессенджер) — не трогать.
+
+### 6. Качество контакта — пока не авто
+
+Не фильтровать чаты эвристиками без разметки. В логе отмечать, если chats↑ а CPL↑ — кандидат на ручной разбор мусора.
+
+### 7. Dry-run по умолчанию
+
+`setManual` только при явном `--apply` / «включи запись» / `AVITO_BID_APPLY=1`, и только `--apply-top`.
+
+## Запуск каждый час
 
 ```bash
 cd bider
-# секреты уже в env автоматизации ИЛИ локально .env.local (не коммитить)
-python3 avito_autobidder.py --days 60
-python3 avito_autobidder.py --days 60 --apply          # боевая запись
-python3 avito_autobidder.py --loop --interval-min 60   # непрерывный цикл
+python3 avito_autobidder.py --days 60 --top-n 50
+# запись узким пулом:
+# python3 avito_autobidder.py --days 60 --apply --apply-top 30
 ```
 
-Выход в `bider/out/`:
+Между двумя запросами `/spendings` скрипт сам ждёт ~65с (лимит API).
 
-- `message_heatmap.html`, `message_hours.csv`, `message_hours.json`
-- `bids.csv`, `summary.json`, `runs.jsonl`
+## Лог на GitHub (обязателен)
 
-## Лог на GitHub
+После прогона или падения — коммит в `xz`:
 
-После каждого прогона (и после падения) закоммить один файл и запушить в ветку `xz`:
+- `bider/logs/YYYY-MM-DD-HH.md` (час МСК)
+- тот же текст → `bider/logs/LATEST.md`
 
-`bider/logs/YYYY-MM-DD-HH.md` — час по Москве, например `bider/logs/2026-10-02-11.md`.
-
-Плюс перезаписать `bider/logs/LATEST.md` тем же текстом, чтобы последний прогон открывался без поиска.
-
-В коммит только эти логи. Не коммить `.env`, токены, `out/` целиком, сырые чаты и имена клиентов.
-
-Шаблон лога:
+Шаблон:
 
 ```markdown
 # Прогон YYYY-MM-DD HH:00 МСК
 
 - Итог: ok | partial | failed
 - Режим: dry-run | apply
-- Кабинет: имя / id
+- Кабинет / id
 
 ## Шаги
-
 | Шаг | Статус | Деталь |
-|-----|--------|--------|
-| auth | ok/fail | HTTP-код, без токена |
-| chats | ok/fail | сколько чатов, пик/тишина |
-| account stats | ok/fail | views, contacts, CR |
-| spendings | ok/fail | spend ₽, CPL |
-| items + bids | ok/fail | сколько объявлений, сколько would-change |
-| setManual | skipped/ok/fail | только если apply |
+| auth | | |
+| chats heatmap | | пик/тишина, hour× dow× |
+| account stats + spend | | CR source views/click_est, CPL period/day |
+| live filter | | live / dead / focus |
+| bids | | would_change / applied |
+| setManual | skipped/ok/fail | |
 
 ## Ошибки
-
-Для каждой: шаг, HTTP или исключение, причина своими словами, что повторить в следующий раз.
-Если ошибок нет — строка «нет».
+шаг, HTTP, почему, что сделать в следующий раз (или «нет»)
 
 ## Цифры
-
-Час, зона, mult, chats, CR, CPL, target 1000 / soft 1200 / hard 1500.
-5–10 примеров item_id: current → new, reason.
+mult, brake, prior_cr, account_cpl, day_cpl, items_live, would_change
+5–10 примеров item_id current→new
 
 ## Что мешает бидеру
-
-1–3 конкретных узких места этого прогона (429, пустая статистика, нет секрета, чужой actionType).
-Это список, по которому упрощаем бидер. Не общие советы.
+1–3 узких места этого часа (429, мало живых, CPL-стоп, нет секрета…)
 ```
 
-Коммит: `bider log YYYY-MM-DD HH MSK`. Пуш в `origin xz`. Если пуш не прошёл — напиши это в ответе автоматизации, лог всё равно оставь в рабочей копии.
-
-Смотреть историю: папка `bider/logs/` на https://github.com/abramovmarketing88-byte/Avito/tree/xz/bider/logs
-
-## Лимиты и ошибки API
-
-| Ситуация | Действие |
-|----------|----------|
-| HTTP 429 | sleep ~65+ с, retry |
-| spendings часто 1 req/min | не долбить подряд |
-| getBids | ≤20/min |
-| setManual | ≤20/min |
-| stats v1 | ≤200 itemIds, окно ≤~90 дней |
-
-Документация: https://developers.avito.ru/api-catalog  
-Messenger: `/messenger/v2/.../chats`  
-Ставки ЦД: `/cpxpromo/1/getBids/{itemId}`, `setManual`, `getPromotionsByItemIds`
-
-## Cursor Automation (облако)
-
-| Поле | Значение |
-|------|----------|
-| Name | Автобидер Авито |
-| Repo / branch | `abramovmarketing88-byte/Avito` / `xz` |
-| Trigger | Every hour (`0 * * * *`) |
-| Secrets | `AVITO_CLIENT_ID`, `AVITO_CLIENT_SECRET` |
-| Default | dry-run |
-| Inactive → Active | после проверки Test |
-
-Инструкция автоматизации: текст из `bider/AGENT_INSTRUCTIONS.md` (запуск скрипта + обязательный лог в `bider/logs/` и пуш в `xz`).
-
-Локальный cron на ПК **не заменяет** облако: если компьютер выключен, локальный прогон не случится. Облачная автоматизация работает без ПК.
+Коммит: `bider log YYYY-MM-DD HH MSK`. Пуш `origin xz`.
 
 ## Антипаттерны
 
-- Класть ключи в `SKILL.md`, README, промпт или git.
-- Вызывать `setManual` без явного разрешения на запись.
-- Менять ставки объявлений с другим типом ЦД (звонок=1, мессенджер=7).
-- Считать CPL только по звонкам.
-- Хардкодить пиковые часы без пересчёта чатов.
-- Путать копейки (`*Penny`) и рубли в spendings.
+- Ставки на объявления без трафика
+- CR только от views, когда есть spend и avg_bid
+- Один множитель на весь день без heatmap
+- Запись всех живых разом без apply-top
+- Ключи в git / в логе
+- Авто-фильтр «мусорных» чатов без разметки
 
-## Первый эталонный прогон (факт)
+## Эталон
 
-Сухой прогон кабинета «Фабрика Мебели»:
-
-- ~155 чатов / 60 дней
-- ~3463 views, 164 contacts, CR ≈ 4.7%
-- spend ≈ 169 тыс. ₽, CPL ≈ **1030 ₽** (в коридоре цели)
-- 1233 active items; ставки не записывались (`applied: 0`)
-
-Используй как sanity-check: резкий уход CPL сильно выше 1500 или CR ≈ 0 при большом spend — красный флаг в отчёте.
+Первые прогоны: chats ~150+, CPL ~1030–1150, active ~1200–1700, live << active.  
+Если live < 15 или day_cpl > 1500 — красный флаг в логе.

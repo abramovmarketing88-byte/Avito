@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Автобидер Авито (CPA-клики, actionTypeID=5).
+Автобидер Авито (CPA-клики, actionTypeID=5) — кабинет «Фабрика Мебели».
 
-1) Сообщения за N дней → heatmap по часу/дню недели (Europe/Moscow).
-2) Статистика объявлений → конверсия контакт/просмотр.
-3) Ставка клика ≈ целевой CPL × CR × множитель часа.
-   Цель 1000 ₽, норма до 1200, жёсткий край 1500.
-4) По умолчанию dry-run. Запись ставок: --apply.
-5) Цикл: --loop --interval-min 60 (или cron каждый час).
-
-Ключи: AVITO_CLIENT_ID / AVITO_CLIENT_SECRET или .env.local рядом со скриптом.
-Не печатает секрет и токен.
+1) Чаты 60д → плавный множитель часа + день недели (МСК).
+2) Только живые объявления (views≥5 / контакты / уже есть ставка), фокус топ-N.
+3) Prior CR кабинета: contacts/(spend/avg_bid) если возможно, иначе contacts/views.
+4) Ставка ≈ 1000 × CR × hour × dow × cpl_brake. Цель 1000, soft 1200, hard 1500.
+5) CPL-стоп: >1200 → ×0.9, >1300 → ×0.75, >1500 → ×0.6.
+6) Dry-run по умолчанию. --apply пишет только --apply-top лучших.
+7) Ключи: AVITO_CLIENT_ID / AVITO_CLIENT_SECRET. Секреты не печатать.
 """
 
 from __future__ import annotations
@@ -38,17 +36,22 @@ DOW = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 TARGET_CPL = 1000.0
 SOFT_CPL = 1200.0
 HARD_CPL = 1500.0
+CPL_BRAKE_SOFT = 1300.0  # суточный/периодный CPL → режем ставки
 # actionTypeID: 5 = пакет кликов (CPA click)
 ACTION_CLICK = 5
 MIN_VIEWS_FOR_CR = 20
 MIN_CONTACTS_FOR_CR = 1
+LIVE_MIN_VIEWS = 5  # ниже — «мёртвое» объявление, ставку не крутим
 ACCOUNT_PRIOR_VIEWS = 100
-# пик / тишина относительно среднего часа
+DEFAULT_TOP_N = 50  # сколько живых объявлений трогаем за проход
+DEFAULT_APPLY_TOP = 30  # при --apply пишем только топ по контактам
+# зоны для отчёта (множитель часа — плавный от heatmap, не ступеньки)
 PEAK_RATIO = 1.35
 QUIET_RATIO = 0.55
-PEAK_MULT = 1.15
-QUIET_MULT = 0.45
-NORMAL_MULT = 0.85
+HOUR_MULT_MIN = 0.40
+HOUR_MULT_MAX = 1.20
+DOW_MULT_MIN = 0.70
+DOW_MULT_MAX = 1.10
 MAX_STEP_RATIO = 0.30  # не менять текущую ставку больше чем на 30% за проход
 
 
@@ -172,6 +175,10 @@ def fetch_chats(token: str, user_id: int, since_ts: int) -> list[dict]:
     return [c for c in chats if int(c.get("created") or 0) >= since_ts]
 
 
+def clamp(n: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, n))
+
+
 def analyze_messages(chats: list[dict]) -> dict:
     by_hour = Counter()
     by_dow = Counter()
@@ -196,25 +203,61 @@ def analyze_messages(chats: list[dict]) -> dict:
         hours.append({"hour": h, "messages": n, "ratio": round(ratio, 2), "band": band})
     peak_hours = [h["hour"] for h in hours if h["band"] == "peak"]
     quiet_hours = [h["hour"] for h in hours if h["band"] == "quiet"]
+    dow_counts = [by_dow.get(d, 0) for d in range(7)]
     return {
         "total_chats": sum(by_hour.values()),
         "avg_per_hour": round(avg, 2),
         "hours": hours,
         "peak_hours": peak_hours,
         "quiet_hours": quiet_hours,
-        "by_dow": {DOW[d]: by_dow.get(d, 0) for d in range(7)},
+        "by_dow": {DOW[d]: dow_counts[d] for d in range(7)},
+        "by_dow_counts": dow_counts,
         "cells": {f"{d}-{h}": by_cell.get((d, h), 0) for d in range(7) for h in range(24)},
     }
 
 
-def hour_multiplier(hour: int, analysis: dict) -> tuple[float, str]:
-    bands = {h["hour"]: h["band"] for h in analysis["hours"]}
-    band = bands.get(hour, "normal")
-    if band == "peak":
-        return PEAK_MULT, band
-    if band == "quiet":
-        return QUIET_MULT, band
-    return NORMAL_MULT, band
+def time_multipliers(now: datetime, analysis: dict) -> dict:
+    """Плавный час из heatmap + день недели. Два пика (утро/вечер) сами вылезают из ratio."""
+    hours = analysis["hours"]
+    ratios = {h["hour"]: float(h["ratio"]) for h in hours}
+    bands = {h["hour"]: h["band"] for h in hours}
+    max_r = max(ratios.values()) if ratios else 1.0
+    max_r = max_r or 1.0
+    r = ratios.get(now.hour, 0.0)
+    hour_mult = clamp(HOUR_MULT_MIN, HOUR_MULT_MAX, HOUR_MULT_MIN + (HOUR_MULT_MAX - HOUR_MULT_MIN) * (r / max_r))
+    band = bands.get(now.hour, "normal")
+
+    dow_counts = analysis.get("by_dow_counts") or [0] * 7
+    avg_dow = (sum(dow_counts) / 7.0) or 1.0
+    today = now.weekday()
+    dr = dow_counts[today] / avg_dow
+    max_dr = max((c / avg_dow for c in dow_counts), default=1.0) or 1.0
+    dow_mult = clamp(DOW_MULT_MIN, DOW_MULT_MAX, DOW_MULT_MIN + (DOW_MULT_MAX - DOW_MULT_MIN) * (dr / max_dr))
+    combined = round(hour_mult * dow_mult, 3)
+    return {
+        "hour_mult": round(hour_mult, 3),
+        "dow_mult": round(dow_mult, 3),
+        "combined": combined,
+        "band": band,
+        "hour_ratio": round(r, 2),
+        "dow_ratio": round(dr, 2),
+        "dow": DOW[today],
+    }
+
+
+def cpl_brake_factor(period_cpl: float | None, day_cpl: float | None) -> tuple[float, str]:
+    """Если CPL уже высокий — давим ставки до пересчёта CR."""
+    ref = day_cpl if day_cpl is not None else period_cpl
+    src = "day" if day_cpl is not None else "period"
+    if ref is None:
+        return 1.0, "none"
+    if ref > HARD_CPL:
+        return 0.60, f"{src}>{HARD_CPL:.0f}"
+    if ref > CPL_BRAKE_SOFT:
+        return 0.75, f"{src}>{CPL_BRAKE_SOFT:.0f}"
+    if ref > SOFT_CPL:
+        return 0.90, f"{src}>{SOFT_CPL:.0f}"
+    return 1.0, f"{src}_ok"
 
 
 def fetch_item_stats(token: str, user_id: int, item_ids: list[int], d0: str, d1: str) -> dict[int, dict]:
@@ -325,10 +368,6 @@ def set_manual_bid(token: str, item_id: int, bid_penny: int, limit_penny: int | 
     return api(token, "POST", "/cpxpromo/1/setManual", body)
 
 
-def clamp(n: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, n))
-
-
 def compute_bid_rub(
     *,
     views: float,
@@ -360,8 +399,8 @@ def compute_bid_rub(
         cpl_factor = 1.08
 
     raw = TARGET_CPL * cr * mult * cpl_factor
-    # мягкий потолок: не целиться выше SOFT при пике
-    soft_cap = SOFT_CPL * cr * (PEAK_MULT if mult >= PEAK_MULT else 1.0)
+    # мягкий потолок по цели SOFT × CR (без старых ступенек PEAK_MULT)
+    soft_cap = SOFT_CPL * cr * max(1.0, min(mult, HOUR_MULT_MAX))
     raw = min(raw, soft_cap if soft_cap > 0 else raw)
     bid = clamp(raw, min_rub, max_rub)
     if current_rub and current_rub > 0:
@@ -412,8 +451,9 @@ th {{ background: #efe6db; }}
 </style></head><body>
 <h1>{html.escape(str(account.get('name') or 'Кабинет'))}</h1>
 <p class="note">Чаты за период: <b>{analysis['total_chats']}</b>.
-Пик (ставка ×{PEAK_MULT}): <b>{peak}</b>.
-Тишина (ставка ×{QUIET_MULT}): <b>{quiet}</b>.
+Пик heatmap: <b>{peak}</b>.
+Тишина: <b>{quiet}</b>.
+Множитель часа плавный {HOUR_MULT_MIN}…{HOUR_MULT_MAX} от доли сообщений; день недели {DOW_MULT_MIN}…{DOW_MULT_MAX}.
 Среднее на час: {analysis['avg_per_hour']}.</p>
 <table>
 <tr><th></th>{''.join(f'<th>{h}</th>' for h in range(24))}</tr>
@@ -466,9 +506,6 @@ def run_once(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    mult, band = hour_multiplier(now.hour, analysis)
-    print(f"сейчас {now:%Y-%m-%d %H:%M} МСК час={now.hour} зона={band} mult={mult}", flush=True)
-
     print("объявления…", flush=True)
     items = fetch_active_items(token)
     titles = {int(it["id"]): (it.get("title") or "")[:120] for it in items if it.get("id")}
@@ -476,22 +513,56 @@ def run_once(args: argparse.Namespace) -> int:
 
     print("статистика кабинета…", flush=True)
     acc = fetch_account_totals(token, user_id, d0s, d1s)
-    prior_cr = (acc["contacts"] / acc["views"]) if acc["views"] else 0.02
-    print("расходы…", flush=True)
+    print("расходы периода…", flush=True)
     spend = fetch_spendings_rub(token, user_id, d0s, d1s)
     account_cpl = (spend / acc["contacts"]) if acc["contacts"] else None
+
+    print("расходы / контакты за сегодня (пауза из‑за лимита spendings)…", flush=True)
+    time.sleep(65)
+    spend_today = fetch_spendings_rub(token, user_id, d1s, d1s)
+    acc_day = fetch_account_totals(token, user_id, d1s, d1s)
+    day_contacts = float(acc_day.get("contacts") or 0)
+    day_cpl = (spend_today / day_contacts) if spend_today and day_contacts else None
+
+    print("текущие продвижения…", flush=True)
+    promos = get_promotions(token, ids)
+    bid_samples = []
+    for row in promos.values():
+        man = row.get("manualPromotion") or {}
+        if man.get("bidPenny"):
+            bid_samples.append(float(man["bidPenny"]) / 100.0)
+    avg_bid = (sum(bid_samples) / len(bid_samples)) if bid_samples else None
+    # CR от клика: contacts / (spend/avg_bid). Иначе fallback на views.
+    prior_src = "views"
+    if spend > 0 and avg_bid and avg_bid > 0 and acc["contacts"]:
+        clicks_est = spend / avg_bid
+        if clicks_est >= acc["contacts"]:
+            prior_cr = acc["contacts"] / clicks_est
+            prior_src = "click_est"
+        else:
+            prior_cr = (acc["contacts"] / acc["views"]) if acc["views"] else 0.02
+    else:
+        prior_cr = (acc["contacts"] / acc["views"]) if acc["views"] else 0.02
+
+    tm = time_multipliers(now, analysis)
+    brake, brake_why = cpl_brake_factor(account_cpl, day_cpl)
+    mult = round(tm["combined"] * brake, 3)
+    band = tm["band"]
     print(
         f"кабинет views={acc['views']:.0f} contacts={acc['contacts']:.0f} "
-        f"cr={prior_cr:.4f} spend≈{spend:.0f} cpl={account_cpl}",
+        f"prior_cr={prior_cr:.4f}({prior_src}) spend≈{spend:.0f} cpl={account_cpl} "
+        f"today_cpl={day_cpl} avg_bid={avg_bid}",
+        flush=True,
+    )
+    print(
+        f"сейчас {now:%Y-%m-%d %H:%M} МСК {tm['dow']} час={now.hour} зона={band} "
+        f"hour×{tm['hour_mult']} dow×{tm['dow_mult']} brake×{brake}({brake_why}) → mult={mult}",
         flush=True,
     )
 
     print("статистика объявлений…", flush=True)
     stats = fetch_item_stats(token, user_id, ids, d0s, d1s)
-    print("текущие продвижения…", flush=True)
-    promos = get_promotions(token, ids)
 
-    # границы ставки: берём с одного объявления (min/max одинаковы в категории часто, но зажимаем по каждому через getBids если надо)
     sample_bounds = None
     for iid in ids[:5]:
         detail = get_bids_detail(token, iid)
@@ -502,16 +573,37 @@ def run_once(args: argparse.Namespace) -> int:
     default_min = (sample_bounds or {}).get("minBidPenny") or 100
     default_max = (sample_bounds or {}).get("maxBidPenny") or 50000
 
+    # Живые объявления: есть трафик или уже стоит ставка. Мёртвые не крутим.
+    live_rows: list[tuple[float, float, int]] = []
+    dead = 0
+    for iid in ids:
+        st = stats.get(iid) or {"views": 0.0, "contacts": 0.0}
+        promo = promos.get(iid) or {}
+        man = promo.get("manualPromotion") or {}
+        has_bid = bool(man.get("bidPenny"))
+        if st["views"] >= LIVE_MIN_VIEWS or st["contacts"] >= MIN_CONTACTS_FOR_CR or has_bid:
+            live_rows.append((st["contacts"], st["views"], iid))
+        else:
+            dead += 1
+    live_rows.sort(key=lambda x: (-x[0], -x[1]))
+    top_n = max(1, int(args.top_n))
+    apply_top = max(1, int(args.apply_top))
+    focus_ids = [iid for _, _, iid in live_rows[:top_n]]
+    apply_ids = set(iid for _, _, iid in live_rows[:apply_top])
+    print(
+        f"живых {len(live_rows)} / мёртвых {dead}; фокус топ-{top_n}={len(focus_ids)}; "
+        f"apply-top={apply_top}",
+        flush=True,
+    )
+
     decisions = []
     applied = 0
-    # rate limit setManual ~20/min — батчим паузой
-    for n, iid in enumerate(ids):
+    for n, iid in enumerate(focus_ids):
         st = stats.get(iid) or {"views": 0.0, "contacts": 0.0}
         promo = promos.get(iid) or {}
         manual = promo.get("manualPromotion") or {}
         cur_penny = manual.get("bidPenny")
         current_rub = (cur_penny / 100.0) if cur_penny else None
-        # per-item bounds only when we will apply or when current missing and item has traffic
         min_penny = int(default_min)
         max_penny = int(default_max)
         bid_rub, cr, reason = compute_bid_rub(
@@ -522,8 +614,9 @@ def run_once(args: argparse.Namespace) -> int:
             min_rub=min_penny / 100.0,
             max_rub=max_penny / 100.0,
             current_rub=current_rub,
-            account_cpl=account_cpl,
+            account_cpl=day_cpl or account_cpl,
         )
+        reason = f"{reason} {prior_src} brake={brake}"
         bid_penny = int(round(bid_rub * 100))
         bid_penny = max(min_penny, min(max_penny, bid_penny))
         action = "hold"
@@ -531,10 +624,12 @@ def run_once(args: argparse.Namespace) -> int:
         action_type = int(promo.get("actionTypeID") or 0)
         if promo and action_type not in (0, ACTION_CLICK):
             action = "skip_other_action"
-        meaningful = st["views"] >= MIN_VIEWS_FOR_CR or st["contacts"] >= MIN_CONTACTS_FOR_CR
         change = current_rub is None or abs(bid_penny - int(cur_penny or 0)) >= 50
-        if action == "hold" and meaningful and change:
-            action = "set" if args.apply else "dry-run"
+        if action == "hold" and change:
+            if args.apply and iid in apply_ids:
+                action = "set"
+            else:
+                action = "dry-run"
         row = {
             "item_id": iid,
             "title": titles.get(iid, ""),
@@ -550,9 +645,8 @@ def run_once(args: argparse.Namespace) -> int:
             "status": status,
         }
         if action == "set":
-            # уточнить min/max именно этого объявления
             detail = get_bids_detail(token, iid)
-            time.sleep(3.1)  # ~20 req/min вместе с set
+            time.sleep(3.1)
             if detail and detail.get("manual"):
                 man = detail["manual"]
                 min_penny = int(man.get("minBidPenny") or min_penny)
@@ -568,8 +662,8 @@ def run_once(args: argparse.Namespace) -> int:
             time.sleep(3.1)
             print(f"  set {iid} {row['new_bid_rub']}₽ → {row['status']}", flush=True)
         decisions.append(row)
-        if (n + 1) % 100 == 0:
-            print(f"  scored {n+1}/{len(ids)}", flush=True)
+        if (n + 1) % 25 == 0:
+            print(f"  scored {n+1}/{len(focus_ids)}", flush=True)
 
     fields = [
         "item_id", "title", "views", "contacts", "cr",
@@ -580,6 +674,7 @@ def run_once(args: argparse.Namespace) -> int:
         w.writeheader()
         w.writerows(decisions)
 
+    would_change = sum(1 for r in decisions if r["action"] in ("dry-run", "set"))
     summary = {
         "ran_at_msk": now.isoformat(timespec="minutes"),
         "account_id": user_id,
@@ -589,26 +684,55 @@ def run_once(args: argparse.Namespace) -> int:
         "peak_hours": analysis["peak_hours"],
         "quiet_hours": analysis["quiet_hours"],
         "now_hour": now.hour,
+        "dow": tm["dow"],
         "band": band,
+        "hour_mult": tm["hour_mult"],
+        "dow_mult": tm["dow_mult"],
+        "cpl_brake": brake,
+        "cpl_brake_why": brake_why,
         "multiplier": mult,
         "account_views": acc["views"],
         "account_contacts": acc["contacts"],
         "prior_cr": prior_cr,
+        "prior_cr_source": prior_src,
+        "avg_bid_rub": avg_bid,
         "spend_rub": spend,
+        "spend_today_rub": spend_today,
         "account_cpl": account_cpl,
+        "day_cpl": day_cpl,
+        "day_contacts": day_contacts,
         "target_cpl": TARGET_CPL,
         "soft_cpl": SOFT_CPL,
         "hard_cpl": HARD_CPL,
-        "items": len(ids),
+        "items_active": len(ids),
+        "items_live": len(live_rows),
+        "items_dead": dead,
+        "items_focus": len(focus_ids),
+        "would_change": would_change,
         "apply": bool(args.apply),
+        "apply_top": apply_top,
         "applied": applied,
-        "formula": "bid = clamp(target_cpl * cr * time_mult * cpl_guard, min, max) with ±30% step",
+        "formula": (
+            "bid = clamp(1000 * CR * hour_mult * dow_mult * cpl_brake, min, max); "
+            "CR=item contacts/views or account click_est; only live top-N; ±30% step"
+        ),
     }
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    log_path = out / "runs.jsonl"
-    with log_path.open("a", encoding="utf-8") as f:
+    with (out / "runs.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(summary, ensure_ascii=False) + "\n")
-    print(json.dumps({k: summary[k] for k in ("chats", "peak_hours", "quiet_hours", "band", "multiplier", "prior_cr", "account_cpl", "items", "applied")}, ensure_ascii=False), flush=True)
+    print(
+        json.dumps(
+            {
+                k: summary[k]
+                for k in (
+                    "chats", "dow", "band", "multiplier", "prior_cr", "prior_cr_source",
+                    "account_cpl", "day_cpl", "items_live", "items_focus", "would_change", "applied",
+                )
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     return 0
 
 
@@ -617,6 +741,13 @@ def main() -> int:
     p.add_argument("--days", type=int, default=60, help="окно сообщений и статистики")
     p.add_argument("--out", default="", help="папка результата")
     p.add_argument("--apply", action="store_true", help="записать ставки (иначе dry-run)")
+    p.add_argument("--top-n", type=int, default=DEFAULT_TOP_N, help="сколько живых объявлений считать")
+    p.add_argument(
+        "--apply-top",
+        type=int,
+        default=DEFAULT_APPLY_TOP,
+        help="при --apply писать ставки только топ-N по контактам",
+    )
     p.add_argument("--loop", action="store_true", help="крутить непрерывно")
     p.add_argument("--interval-min", type=int, default=60, help="пауза между проходами в --loop")
     args = p.parse_args()
