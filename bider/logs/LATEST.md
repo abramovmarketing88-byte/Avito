@@ -4,6 +4,8 @@
 - Режим: dry-run
 - Кабинет / id: Фабрика Мебели / fabrika-mebeli
 
+Повтор в 14:43 МСК. Команда: `python3 avito_autobidder.py --cabinet fabrika-mebeli`. `write_bids` нет, `buy_vas` нет.
+
 ## Шаги
 
 | Шаг | Статус | Деталь |
@@ -25,7 +27,7 @@ mult —, brake —, prior_cr —, account_cpl —, day_cpl —, items_live —,
 
 Примеров item_id нет: расчёт ставок не начинался.
 
-Из `bider/cabinets/fabrika-mebeli.json`: target 1000, soft 1200, brake 1300, hard 1500, action_type 5, days 60, top_n 50, apply_top 30, vas_max 1, write_bids нет, buy_vas нет. Скрипт напечатал кабинет и пороги, затем остановился.
+Скрипт напечатал кабинет и пороги: лид 1000/1200/1500, тормоз 1300, actionType 5. Из `bider/cabinets/fabrika-mebeli.json`: days 60, top_n 50, apply_top 30, vas_max 1, write_bids нет, buy_vas нет.
 
 ## Что мешает бидеру
 
