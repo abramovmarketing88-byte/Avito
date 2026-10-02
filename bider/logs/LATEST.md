@@ -1,38 +1,54 @@
-# Прогон 2026-10-02 14:00 МСК
+# Прогон 2026-10-02 14:55 МСК
 
-- Итог: failed
+- Итог: ok
 - Режим: dry-run
 - Кабинет / id: Фабрика Мебели / fabrika-mebeli
+- Аккаунт: 181493224
 
-Повтор в 14:43 МСК. Команда: `python3 avito_autobidder.py --cabinet fabrika-mebeli`. `write_bids` нет, `buy_vas` нет.
+Команда: `python3 avito_autobidder.py --cabinet fabrika-mebeli`. `write_bids` нет, `buy_vas` нет. Завершился с кодом 0.
 
 ## Шаги
 
 | Шаг | Статус | Деталь |
 | --- | --- | --- |
-| auth | failed | `AVITO_CLIENT_ID` и `AVITO_CLIENT_SECRET` в окружении пустые, скрипт вышел до запроса токена |
-| chats heatmap | skipped | до авторизации не дошли |
-| account stats + spend | skipped | до авторизации не дошли |
-| live filter | skipped | до авторизации не дошли |
-| bids | skipped | would_change 0 / applied 0 |
-| setManual | skipped | `write_bids` нет, HTTP к API не было |
+| auth | ok | токен получен, аккаунт 181493224 «Фабрика Мебели» |
+| chats heatmap | ok | 140 чатов за 60д; пик 10–12, 14–15, 19–20, 22; тишина 0–7 и 17; hour×1.2 dow×1.1 |
+| account stats + spend | ok | CR source click_est; CPL периода 1168 ₽; за сегодня расход 4767 ₽ и 0 контактов, day_cpl нет |
+| live filter | ok | живых 38 / мёртвых 1765 / активных 1803; фокус 38 из top-50 |
+| bids | ok | would_change 38 / applied 0 |
+| setManual | skipped | dry-run, HTTP записи не было |
+| VAS | ok | 1 кандидат highlight, покупка не шла (`apply=False`) |
+
+На воронке было несколько HTTP 429, скрипт ждал 65–105 с и дошёл до конца.
 
 ## Ошибки
 
-auth, HTTP нет: процесс завершился на проверке секретов (`exit 1`). Значения ключей в лог, git и командную строку не копировались. В следующий час нужны секреты этой автоматизации `AVITO_CLIENT_ID` и `AVITO_CLIENT_SECRET`.
+нет
 
 ## Цифры
 
-mult —, brake —, prior_cr —, account_cpl —, day_cpl —, items_live —, would_change 0.
+mult 1.32, brake 1.0 (period_ok, период ≤1200), prior_cr 0.0135 (click_est), account_cpl 1168, day_cpl нет, items_live 38, would_change 38.
 
-Примеров item_id нет: расчёт ставок не начинался.
+Просмотры 3491, контакты 153, расход за 60д 178709 ₽, средняя ручная ставка 15.79 ₽. Пятница, час 14, зона peak.
 
-Скрипт напечатал кабинет и пороги: лид 1000/1200/1500, тормоз 1300, actionType 5. Из `bider/cabinets/fabrika-mebeli.json`: days 60, top_n 50, apply_top 30, vas_max 1, write_bids нет, buy_vas нет.
+Примеры item_id current→new, ₽:
+
+- 8293785751: 13.0→16.9 (views 378, contacts 17)
+- 8293712617: 11.0→14.3 (views 100, contacts 9)
+- 8292895156: 20.0→26.0 (views 87, contacts 7)
+- 8293466578: 13.0→16.9 (views 170, contacts 6)
+- 3398017581: 22.0→26.94 (views 147, contacts 3)
+- 8293373176: 13.0→16.9 (views 7, contacts 3)
+- 8293305592: 13.0→16.9 (views 17, contacts 2)
+- 8293158327: 17.0→17.84 (views 9, contacts 2)
+
+VAS-план: 8292984125 highlight, 243 показа, CTR 3.29%, 170 ₽, dry-run.
 
 ## Что мешает бидеру
 
-1. Секреты автоматизации не попали в окружение, поэтому не было ни чатов, ни статистики, ни ставок.
-2. Пока ключей нет, CPL и живые объявления за этот час неизвестны.
+1. За сегодня уже 4767 ₽ расхода и 0 контактов, но day_cpl пустой, поэтому тормоз остался ×1.0 от периода (1168 ₽).
+2. Живых объявлений 38 при 1803 активных: почти весь кабинет без трафика и без ставки.
+3. Воронка упёрлась в 429, прогон растянулся ожиданиями API.
 
 ---
 
