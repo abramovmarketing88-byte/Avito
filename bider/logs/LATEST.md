@@ -7,7 +7,7 @@
 - Цена лида: target 1000 / soft 1200 / brake 1300 / hard 1500
 - Объём: days 60, top_n 50, apply_top 30, write_bids нет, vas_max 1, buy_vas нет
 
-Команда: `python3 avito_autobidder.py --cabinet fabrika-mebeli`. Ключи и токен в лог не писались. Прогон 10:00 МСК, код выхода 1.
+Команда: `python3 avito_autobidder.py --cabinet fabrika-mebeli`. Ключи и токен в лог не писались. Прогон 10:34 МСК, код выхода 1.
 
 ## Шаги
 
