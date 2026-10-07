@@ -1,0 +1,16 @@
+{
+  "name": "Фабрика Мебели",
+  "niche": "мебель на заказ",
+  "lead": "чат + телефон",
+  "action_type": 5,
+  "target_cpl": 1000,
+  "soft_cpl": 1200,
+  "brake_cpl": 1300,
+  "hard_cpl": 1500,
+  "days": 60,
+  "top_n": 50,
+  "apply_top": 30,
+  "vas_max": 1,
+  "write_bids": false,
+  "buy_vas": false
+}
